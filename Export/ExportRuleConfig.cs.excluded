@@ -1,0 +1,914 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Xml;
+using System.Data;
+using System.IO;
+using System.Text.RegularExpressions;
+using System.Xml.Schema;
+using ExportIO.Export.Entity;
+using ExportIO.Export.Util;
+using ExportIO.Export.Entity.Region;
+using ExportIO.Export.Element;
+
+namespace ExportIO.Export
+{
+    /**
+     * 问题：
+     * 1、XML配置无效参数怎么办？（分析必须参数与可选参数，必须参数抛出异常，可选参数无效时可忽略或用默认值）
+     * 2、可设置解析策略：错误、警告、提示
+     * 3、加载数据时，某些必须数据源DataTable不提供怎么办？某些DataTable的必须的数据项不存在怎么办？
+     */
+    /// <summary>
+    /// 导出配置
+    /// </summary>
+    [Obsolete("由新的解析类代替")]
+    public class ExportRuleConfig
+    {
+        private string _basePath;
+        //private XmlReader _xmlReader = null;
+        private XmlDocument _xmlDoc = null;
+        private IList<ProductRule> _productTypes;
+        private bool _parseErrorExit;
+        private XmlNamespaceManager _xnameManager = null;
+        private bool _schamaUsed = false;
+        private const string XMLNS_Prefix = "szly:";   /* 可与xml文件上指定命名空间前缀无关 */
+        //private string xmlnsUri = "http://tempuri.org/schema.xsd";
+
+        private string _schemaFile = null;
+
+        /// <summary>
+        /// 获取所有产出物规则
+        /// </summary>
+        public IList<ProductRule> ProductTypes
+        {
+            get { return _productTypes; }
+            set { _productTypes = value; }
+        }
+
+        /// <summary>
+        /// 解析出错直接退出
+        /// </summary>
+        public bool ParseErrorExit
+        {
+            get { return _parseErrorExit; }
+            set { _parseErrorExit = value; }
+        }
+
+        /// <summary>
+        /// 模板根路径
+        /// </summary>
+        public string BasePath
+        {
+            get { return _basePath; }
+            set
+            {
+                _basePath = value;
+                CalculatePath();
+            }
+        }
+
+        private ExportRuleConfig() { }
+
+        private ExportRuleConfig(XmlReader xmlReader, string xsdFile, bool parseErrorExit = true)
+        {
+            _productTypes = new List<ProductRule>();
+            //_xmlReader = xmlReader;
+            _xmlDoc = new XmlDocument();
+            _xmlDoc.Load(xmlReader);
+            _schemaFile = xsdFile;
+            _parseErrorExit = parseErrorExit;
+            ValidateXml();
+            parseXML();
+        }
+
+        /// <summary>
+        /// 配置文件中"相对路径"基于配置文件所在文件夹计算
+        /// </summary>
+        private void CalculatePath()
+        {
+            string tmpDir = System.Environment.CurrentDirectory;
+            System.Environment.CurrentDirectory = _basePath;
+            foreach (var prod in _productTypes)
+            {
+                prod.Template = new FileInfo(prod.Template).FullName; //Path.Combine(finfo.Directory.FullName, prod.Template);
+                if (!string.IsNullOrEmpty(prod.Export))
+                {
+                    prod.Export = new FileInfo(prod.Export).FullName;
+                }
+            }
+            System.Environment.CurrentDirectory = tmpDir;
+        }
+
+        /// <summary>
+        /// 检查xml是否引用XSD
+        /// </summary>
+        private void checkSchema()
+        {
+            XmlNode root = null;
+            foreach (XmlNode node in _xmlDoc.ChildNodes)
+            {
+                if (node.NodeType == XmlNodeType.Element)
+                {
+                    root = node;
+                    break;
+                }
+            }
+            if (root == null) return;
+            if (!string.IsNullOrEmpty(root.NamespaceURI))
+            {
+                _schamaUsed = true;
+                //xmlnsUri = root.NamespaceURI;
+                _xnameManager = new XmlNamespaceManager(_xmlDoc.NameTable);
+                _xnameManager.AddNamespace(XMLNS_Prefix.Split(':')[0], root.NamespaceURI);
+            }
+        }
+
+        /// <summary>
+        /// 使用Schema检查XML
+        /// </summary>
+        public void ValidateXml()
+        {
+            checkSchema();
+            if (!File.Exists(_schemaFile))
+            {
+                Console.WriteLine("SchemaFile '{0}' not found!");
+                return;
+            }
+            if (_schamaUsed)
+            {
+                XmlSchemaSet schemas = new XmlSchemaSet();
+
+                #region 找出targetNamespace
+                string targetNamespace = "http://tempuri.org/schema.xsd";
+                XmlDocument schemaDoc = new XmlDocument();
+                schemaDoc.Load(_schemaFile);
+                foreach (XmlNode node in schemaDoc.ChildNodes)
+                {
+                    if (node.LocalName == "schema")
+                    {
+                        targetNamespace = node.Attributes["targetNamespace"].Value;
+                        break;
+                    }
+                }
+                #endregion 找出targetNamespace
+
+                schemas.Add(targetNamespace, XmlReader.Create(_schemaFile));//与前面共用Reader会报错！
+                _xmlDoc.Schemas = schemas;
+
+                StringBuilder sbStr = new StringBuilder();
+                _xmlDoc.Validate(new ValidationEventHandler((obj, e) =>
+                {
+                    if (e.Severity == XmlSeverityType.Error)
+                    {
+                        sbStr.AppendLine(e.Message);
+                    }
+                    else
+                    {
+                        sbStr.AppendLine(e.Message);
+                    }
+                }));
+
+                if (_parseErrorExit && sbStr.Length > 0)
+                    throw new ParseErrorException(sbStr.ToString());
+            }
+        }
+
+        private XmlNodeList querySubNodes(string query, XmlElement element = null)
+        {
+            string xpath = string.Format(query, _schamaUsed ? XMLNS_Prefix : "");
+            if (!_schamaUsed)
+            {
+                if (element == null) return _xmlDoc.SelectNodes(xpath);
+                return element.SelectNodes(xpath);
+            }
+            else
+            {
+                if (element == null) return _xmlDoc.SelectNodes(xpath, _xnameManager);
+                return element.SelectNodes(xpath, _xnameManager);
+            }
+        }
+
+        /// <summary>
+        /// 解析XML
+        /// </summary>
+        private void parseXML()
+        {
+            XmlNodeList nodelist = querySubNodes("//{0}ExportProduct");
+
+            ProductRule productType = null;
+            XmlElement element = null;
+            XmlNodeList tmpList;
+            Sheet tmpSheet;
+            for (int i = 0; i < nodelist.Count; i++)
+            {
+                element = nodelist[i] as XmlElement;
+                if (element != null)
+                {
+                    productType = new ProductRule()
+                    {
+                        Name = element.GetAttribute("name"),
+                        Template = element.GetAttribute("template"),
+                        Export = element.GetAttribute("export")
+                    };
+                    string tmpStr = element.GetAttribute("shrinkSheet");
+                    productType.ShrinkSheet = !string.IsNullOrEmpty(tmpStr) && tmpStr.ToLower().Equals("true") ? true : false;
+                    tmpStr = element.GetAttribute("shrinkExSheets");
+                    productType.ShrinkExSheets = string.IsNullOrEmpty(tmpStr) ? new string[0] : tmpStr.Split(',');
+
+                    productType.AddSources(parseDataSource(querySubNodes("{0}DataSource/*", element), productType));
+                    //productType.Sheets = new List<Sheet>();
+                    tmpList = querySubNodes("{0}Sheets/*", element);
+                    for (int j = 0; j < tmpList.Count; j++)
+                    {
+                        element = tmpList[j] as XmlElement;
+                        if (element != null)
+                        {
+                            tmpSheet = new Sheet(productType);
+                            tmpSheet.Name = element.GetAttribute("name");
+                            tmpStr = element.GetAttribute("dynamic");
+                            tmpSheet.IsDynamic = string.IsNullOrEmpty(tmpStr) ? false : bool.Parse(tmpStr);
+                            tmpStr = element.GetAttribute("source");
+                            if (!string.IsNullOrEmpty(tmpStr))
+                            {
+                                Source source = productType.GetSource(tmpStr);
+                                if (source == null)
+                                {
+                                    source = new Source(tmpStr);
+                                    productType.RegistSource(source);
+                                }
+                                tmpSheet.SetDynamicSource(source);
+                            }
+                            tmpStr = element.GetAttribute("nameRule");
+                            if (!string.IsNullOrEmpty(tmpStr))
+                            {
+                                tmpSheet.NameRule = tmpStr;
+                            }
+                            tmpSheet.AddCells(parseCell(querySubNodes("{0}Cells/{0}Cell", element), tmpSheet));
+                            tmpSheet.AddTables(parseTable(querySubNodes("{0}Tables/{0}Table", element), tmpSheet));
+                            tmpSheet.AddTables(parseHeaderTable(querySubNodes("{0}Tables/{0}HeaderTable", element), tmpSheet));
+                            tmpSheet.AddTables(parseDynamicArea(querySubNodes("{0}DynamicAreas/{0}DynamicArea", element), tmpSheet));
+                            productType.AddSheet(tmpSheet);
+                        }
+                    }
+                    _productTypes.Add(productType);
+                }
+            }
+        }
+
+        private List<DynamicArea> parseDynamicArea(XmlNodeList nodes, Sheet sheet)
+        {
+            List<DynamicArea> containers = new List<DynamicArea>();
+            foreach (var node in nodes)
+            {
+                XmlElement element = node as XmlElement;
+                if (element != null)
+                {
+                    string tmpStr = element.GetAttribute("location");
+                    Location location = new Location(tmpStr);
+                    DynamicArea container = new DynamicArea(sheet.ProductRule, sheet, location);
+                    tmpStr = element.GetAttribute("source");
+                    container.SourceName = tmpStr;
+                    Source tmpSource = sheet.ProductRule.GetSource(tmpStr);
+                    if (tmpSource == null)
+                    {
+                        tmpSource = new Source(tmpStr);
+                        sheet.ProductRule.RegistSource(tmpSource);
+                    }
+                    container.Source = tmpSource;
+                    container.AddCells(parseCell(querySubNodes("{0}Cells/{0}Cell", element), container));
+                    container.AddTables(parseTable(querySubNodes("{0}Tables/{0}Table", element), container));
+                    containers.Add(container);
+                }
+            }
+            return containers;
+        }
+
+        private List<RegionTable> parseHeaderTable(XmlNodeList nodes, Sheet sheet)
+        {
+
+            List<RegionTable> tables = new List<RegionTable>();
+
+            XmlElement element = null;
+            RegionTable table = null;
+            string tmpStr = null;
+            Location tmpLocation = null;
+            foreach (var item in nodes)
+            {
+                element = item as XmlElement;
+                if (element != null)
+                {
+                    tmpStr = element.GetAttribute("location");
+                    tmpLocation = new Location(tmpStr);
+
+                    table = new RegionTable(sheet.ProductRule, sheet, tmpLocation);
+                    tmpStr = element.GetAttribute("freeze");
+                    table.Freeze = !string.IsNullOrEmpty(tmpStr) && tmpStr.ToLower().Equals("true") ? true : false;
+
+                    #region Region区域解析
+                    XmlNodeList regionNodes = querySubNodes("{0}Region", element);
+                    if (regionNodes.Count > 0)
+                    {
+                        foreach (var regionNode in regionNodes)
+                        {
+                            Region region = parseRegion(regionNode as XmlElement, sheet.ProductRule, table as RegionTable);
+                            if (region != null)
+                            {
+                                (table as RegionTable).AddRegion(region);
+                            }
+                        }
+                        (table as RegionTable).LinkRegionSource();
+                    }
+                    #endregion Region区域解析
+
+                    tables.Add(table);
+                }
+            }
+            return tables;
+        }
+
+        private List<Table> parseTable(XmlNodeList nodes, BaseContainer contianer)
+        {
+            List<Table> tables = new List<Table>();
+
+            XmlElement element = null;
+            Table table = null;
+            string tmpStr = null;
+            string[] fieldArray = null;
+            Location tmpLocation = null;
+            Source tmpSource = null;
+            foreach (var item in nodes)
+            {
+                element = item as XmlElement;
+                if (element != null)
+                {
+                    tmpStr = element.GetAttribute("location");//必须
+                    tmpLocation = new Location(tmpStr);
+                    tmpStr = element.GetAttribute("source");
+                    if (!string.IsNullOrEmpty(tmpStr))
+                    {
+                        table = new Table(contianer.ProductRule, contianer, tmpLocation);
+                        table.SourceName = tmpStr;
+                        //只要不是动态解析的数据源，Source不能为空
+                        if ((contianer is Sheet && !(contianer as Sheet).IsDynamic) || !DynamicSource.NeedDynamicParse(tmpStr))
+                        {
+                            tmpSource = contianer.ProductRule.GetSource(tmpStr);
+                            if (tmpSource == null)
+                            {
+                                tmpSource = new Source(tmpStr);
+                                contianer.ProductRule.RegistSource(tmpSource);
+                            }
+                            table.SetSource(tmpSource);
+                        }
+                    }
+                    tmpStr = element.GetAttribute("rowNumIndex");
+                    table.RowNumIndex = string.IsNullOrEmpty(tmpStr) ? -1 : ParseUtil.IsNumeric(tmpStr) ? int.Parse(tmpStr) : ParseUtil.FromBase26(tmpStr);
+                    tmpStr = element.GetAttribute("copyFill");
+                    table.CopyFill = string.IsNullOrEmpty(tmpStr) ? true : bool.Parse(tmpStr);
+                    tmpStr = element.GetAttribute("sumLocation");
+                    table.SumLocation = string.IsNullOrEmpty(tmpStr) ? LocationPolicy.Undefined : (LocationPolicy)Enum.Parse(typeof(LocationPolicy), tmpStr, true);
+                    tmpStr = element.GetAttribute("sumOffset");
+                    table.SumOffset = string.IsNullOrEmpty(tmpStr) ? (table.SumLocation == LocationPolicy.Undefined || table.SumLocation == LocationPolicy.Absolute ? -1 : 0) : int.Parse(tmpStr);
+                    tmpStr = element.GetAttribute("autoFitHeight");
+                    table.AutoFitHeight = string.IsNullOrEmpty(tmpStr) ? false : bool.Parse(tmpStr);
+                    tmpStr = element.GetAttribute("groupLevel");
+                    int groupLevel = string.IsNullOrEmpty(tmpStr) ? 0 : int.Parse(tmpStr);
+                    if (groupLevel > 0)
+                    {
+                        tmpStr = element.GetAttribute("groupNumShow");
+                        if (!string.IsNullOrEmpty(tmpStr))
+                        {
+                            bool[] shows = new bool[groupLevel];
+                            string[] bools = tmpStr.Split(',');
+
+                            for (int i = 0; i < bools.Length && i < shows.Length; i++)
+                            {
+                                if (bool.Parse(bools[i]))
+                                {
+                                    shows[i] = true;
+                                }
+                            }
+                            table.SetGroup(shows);
+                        }
+                    }
+
+                    table.AdjustSumOffset();
+
+                    #region Field重复出现的处理
+                    IList<Field> fieldlist = new List<Field>();
+                    tmpStr = element.GetAttribute("fields");
+                    if (!string.IsNullOrEmpty(tmpStr))
+                    {
+                        fieldArray = tmpStr.Split(',');
+                        foreach (var fieldname in fieldArray)
+                        {
+                            fieldlist.Add(new Field(table, fieldname));
+                        }
+                    }
+                    table.AddFields(fieldlist);
+
+                    XmlNodeList fieldNodes = querySubNodes("{0}Field", element);
+                    if (fieldNodes.Count > 0)
+                    {
+                        foreach (var fieldNode in fieldNodes)
+                        {
+                            Field field = parseField(fieldNode as XmlElement, contianer.ProductRule, table);
+                            if (field != null)
+                            {
+                                table.AddField(field);
+                            }
+                        }
+                    }
+                    #endregion Field重复出现的处理
+
+                    #region 行号处理
+                    XmlNodeList rowNumNodes = querySubNodes("{0}RowNum", element);
+                    if (rowNumNodes.Count > 0 && rowNumNodes[0] is XmlElement)
+                    {
+                        tmpStr = (rowNumNodes[0] as XmlElement).GetAttribute("index");
+                        table.RowNumIndex = string.IsNullOrEmpty(tmpStr) ? table.ColIndex : int.Parse(tmpStr);
+                        //如设置行号所在列索引小于指定区域，将被调整为起点列
+                        if (table.RowNumIndex < table.ColIndex)
+                        {
+                            table.RowNumIndex = table.ColIndex;
+                        }
+                    }
+                    #endregion 行号处理
+
+                    //区域计算：计算行号、字段的列位置，以及Table填充列范围
+                    table.CalculateArea();
+
+                    //汇总列：在确定字段位置之后处理
+                    tmpStr = element.GetAttribute("sumColumns");
+                    if (!string.IsNullOrEmpty(tmpStr))
+                    {
+                        string[] columns = tmpStr.Split(',');
+                        table.AddSumColumns(columns);
+                    }
+
+                    tables.Add(table);
+                }
+            }
+            return tables;
+        }
+
+        private Region parseRegion(XmlElement element, ProductRule prod, RegionTable table)
+        {
+            if (element == null || element.Name != "Region") return null;
+
+            string tmpStr = element.GetAttribute("type");
+            if (string.IsNullOrEmpty(tmpStr))
+            {
+                return null;
+            }
+            Region region = "corner".Equals(tmpStr.ToLower()) ? (Region)new CornerRegion(table) :
+                "rowheader".Equals(tmpStr.ToLower()) ? new RowHeaderRegion(table) :
+                "columnheader".Equals(tmpStr.ToLower()) ? (Region)new ColumnHeaderRegion(table) :
+                new BodyRegion(table);
+            tmpStr = element.GetAttribute("source");
+            if (!string.IsNullOrEmpty(tmpStr))
+            {
+                string[] values = tmpStr.Split('.');
+                if (values.Length > 1)
+                {
+                    region.Field = values[1];
+                }
+                Source tmpSource = prod.GetSource(values[0]);
+                if (tmpSource == null)
+                {
+                    tmpSource = new Source(values[0]);
+                    prod.RegistSource(tmpSource);
+                }
+                region.Source = tmpSource;
+            }
+            tmpStr = element.GetAttribute("emptyFill");
+            if (!string.IsNullOrEmpty(tmpStr))
+            {
+                region.EmptyFill = tmpStr;
+            }
+
+            if (region is BodyRegion)
+            {
+                //暂无逻辑
+            }
+            else if (region is HeaderRegion)
+            {
+                HeaderRegion header = region as HeaderRegion;
+                tmpStr = element.GetAttribute("headerBodyMaping");
+                header.HeaderBodyRelation = parseRelation(header.Source, tmpStr, prod);
+                tmpStr = element.GetAttribute("treeSource");
+                header.TreeSource = parseTreeSource(tmpStr, element.GetAttribute("treeInnerMapping"), prod);
+                //header.IdField = element.GetAttribute("IdField");
+                //header.ParentField = element.GetAttribute("parentField");
+                tmpStr = element.GetAttribute("headerTreeMapping");
+                header.HeaderTreeRelation = parseRelation(header.Source, tmpStr, prod);
+                if (header.HeaderTreeRelation != null)
+                {
+                    header.HeaderTreeRelation.ReferecedSource = header.TreeSource;
+                    tmpStr = element.GetAttribute("maxLevel");
+                    if (!string.IsNullOrEmpty(tmpStr))
+                    {
+                        header.MaxLevel = int.Parse(tmpStr);
+                    }
+                    tmpStr = element.GetAttribute("colSpannable");
+                    if (!string.IsNullOrEmpty(tmpStr))
+                    {
+                        header.ColSpannable = bool.Parse(tmpStr);
+                    }
+                    tmpStr = element.GetAttribute("rowSpannable");
+                    if (!string.IsNullOrEmpty(tmpStr))
+                    {
+                        header.RowSpannable = bool.Parse(tmpStr);
+                    }
+                    tmpStr = element.GetAttribute("basedSource");
+                    if (!string.IsNullOrEmpty(tmpStr))
+                    {
+                        header.IsBasedOn = bool.Parse(tmpStr);
+                    }
+                }
+            }
+            else if (region is CornerRegion)
+            {
+                tmpStr = element.GetAttribute("spanRule");
+                if (!string.IsNullOrEmpty(tmpStr))
+                {
+                    CornerSpanRule spanRule = CornerSpanRule.None;
+                    if (!Enum.TryParse(tmpStr, true, out spanRule))
+                    {
+                        spanRule = "row".Equals(tmpStr.ToLower()) ? CornerSpanRule.BaseOnRowHeader :
+                            "column".Equals(tmpStr.ToLower()) ? CornerSpanRule.BaseOnColumnHeader :
+                            "one".Equals(tmpStr.ToLower()) ? CornerSpanRule.AllInOne : CornerSpanRule.None;
+                    }
+                    (region as CornerRegion).SpanRule = spanRule;
+                }
+            }
+            return region;
+        }
+
+        private TreeSource parseTreeSource(string source, string mapping, ProductRule prod)
+        {
+            TreeSource treeSource = null;
+            if (!string.IsNullOrEmpty(source) && source.Contains('.')
+                && !string.IsNullOrEmpty(mapping) && mapping.Contains(':'))
+            {
+                string name = source.Split('.')[0];
+                Source tmpSource = prod.GetSource(name);
+                //treeSource = tmpSource != null ? tmpSource as TreeSource : new TreeSource(name);
+                if (tmpSource == null)
+                {
+                    treeSource = new TreeSource(name);
+                    prod.RegistSource(treeSource);
+                }
+                else if (tmpSource is TreeSource)
+                {
+                    treeSource = tmpSource as TreeSource;
+                }
+                else
+                {
+                    //替换原有Source
+                    treeSource = new TreeSource(name);
+                    prod.RegistSource(treeSource);
+                }
+                treeSource.ContentField = source.Split('.')[1];
+                treeSource.IdField = mapping.Split(':')[0];
+                treeSource.ParentIdField = mapping.Split(':')[1];
+            }
+            return treeSource;
+        }
+
+        private SourceRelation parseRelation(Source source, string tmpStr, ProductRule prod)
+        {
+            if (!string.IsNullOrEmpty(tmpStr))
+            {
+                string[] values = tmpStr.Split(':');
+                SourceRelation relation = new SourceRelation();
+                relation.Source = source;
+                relation.Field = values[0];
+                if (values.Length > 0)
+                {
+                    tmpStr = values[1];
+                    if (tmpStr.Contains('.'))
+                    {
+                        relation.ReferecedField = tmpStr.Split('.')[1];
+                        tmpStr = tmpStr.Split('.')[0];
+                        Source tmpSource = prod.GetSource(tmpStr);
+                        if (tmpSource == null)
+                        {
+                            tmpSource = new Source(tmpStr);
+                            prod.RegistSource(tmpSource);
+                        }
+                        relation.ReferecedSource = tmpSource;
+                    }
+                    else
+                    {
+                        relation.ReferecedField = tmpStr;
+                    }
+                }
+                return relation;
+            }
+            return null;
+        }
+
+        private Field parseField(XmlElement element, ProductRule prod, Table table)
+        {
+            if (element != null && element.Name == "Field")
+            {
+                Field field = new Field(table, element.GetAttribute("name"));
+                //field.Name = element.GetAttribute("name");
+                string tmpStr = element.GetAttribute("colIndex");
+                field.ColIndex = string.IsNullOrEmpty(tmpStr) ? -1 : ParseUtil.IsNumeric(tmpStr) ? int.Parse(tmpStr) : ParseUtil.FromBase26(tmpStr);
+                tmpStr = element.GetAttribute("type");
+                try
+                {
+                    field.Type = string.IsNullOrEmpty(tmpStr) ? FieldType.Unknown : (FieldType)Enum.Parse(typeof(FieldType), tmpStr, true);
+                }
+                catch
+                {
+                    string message = string.Format("字段类型{0}解析出错!", tmpStr);
+                    if (ParseErrorExit)
+                    {
+                        throw new ParseErrorException(message);
+                    }
+                    else
+                    {
+                        field.Type = FieldType.Text;
+                        Console.WriteLine(message);
+                    }
+                }
+                field.Format = element.GetAttribute("format");
+                field.CommentColumn = element.GetAttribute("annnotationField");
+                field.RefColumn = element.GetAttribute("refField");
+                field.LinkType = element.GetAttribute("linkType");
+                tmpStr = element.GetAttribute("dropDownListSource");
+                if (!string.IsNullOrEmpty(tmpStr))
+                {
+                    Source tmpSource = prod.GetSource(tmpStr);
+                    /**
+                     * dropDownListSource数据源要么引用预定义的DataList，要么指定了DataTable.Field；否则将被忽略
+                     */
+                    if (tmpSource != null && tmpSource is ListSource)
+                    {
+                        field.DropDownListSource = tmpSource as ListSource;
+                    }
+                    else if (tmpSource == null && tmpStr.Contains('.'))
+                    {
+                        tmpSource = new ListSource(tmpStr.Split('.')[0], tmpStr.Split('.')[1]);
+                        field.DropDownListSource = tmpSource as ListSource;
+                        prod.RegistSource(tmpSource);
+                    }
+                }
+                tmpStr = element.GetAttribute("spannable");
+                field.Spannable = string.IsNullOrEmpty(tmpStr) ? false : bool.Parse(tmpStr);
+                tmpStr = element.GetAttribute("colspan");
+                field.ColSpan = string.IsNullOrEmpty(tmpStr) ? 1 : int.Parse(tmpStr);
+                tmpStr = element.GetAttribute("sumfield");
+                field.SumField = string.IsNullOrEmpty(tmpStr) ? false : bool.Parse(tmpStr);
+                field.EmptyFill = element.GetAttribute("emptyFill");
+                return field;
+            }
+            return null;
+        }
+
+        private List<Cell> parseCell(XmlNodeList nodes, BaseContainer container)
+        {
+            List<Cell> cells = new List<Cell>();
+            if (nodes == null) return cells;
+
+            XmlElement element = null;
+            Cell cell = null;
+            string tmpStr = null;
+            try
+            {
+                Source tmpSource = null;
+                foreach (var item in nodes)
+                {
+                    element = item as XmlElement;
+                    if (element != null)
+                    {
+                        tmpStr = element.GetAttribute("location");
+                        cell = new Cell(container.ProductRule, container, new Location(tmpStr));
+                        tmpStr = element.GetAttribute("source");
+                        cell.SourceName = tmpStr;
+                        if (tmpStr != null)
+                        {
+                            if (tmpStr.Contains('.'))
+                            {
+                                cell.Field = tmpStr.Split('.')[1];
+                                tmpStr = tmpStr.Split('.')[0];
+                            }
+                            //不存在时抛错 cell.Source = prod.DataSource.First(p => p.Name == tmpStr);
+                            tmpSource = container.ProductRule.GetSource(tmpStr);
+                            if (tmpSource == null)
+                            {
+                                tmpSource = new Source(tmpStr);
+                                container.ProductRule.RegistSource(tmpSource);
+                            }
+                            cell.Source = tmpSource;
+                        }
+                        tmpStr = element.GetAttribute("index");
+                        cell.DataIndex = string.IsNullOrEmpty(tmpStr) ? 0 : int.Parse(tmpStr);
+                        tmpStr = element.GetAttribute("valueAppend");
+                        cell.ValueAppend = string.IsNullOrEmpty(tmpStr) ? false : bool.Parse(tmpStr);
+                        cell.Value = element.GetAttribute("value");
+
+                        cells.Add(cell);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                throw new Exception(string.Format("值{0}解析出错！", tmpStr), ex);
+            }
+            return cells;
+        }
+
+        private List<Source> parseDataSource(XmlNodeList nodes, ProductRule prodRule)
+        {
+            List<Source> list = new List<Source>();
+            if (nodes == null) return list;
+
+            XmlElement element = null;
+            string tmpStr = null;
+            Source source;
+            try
+            {
+                foreach (XmlNode item in nodes)
+                {
+                    element = item as XmlElement;
+                    if (element != null)
+                    {
+                        tmpStr = element.GetAttribute("name");
+                        if (element.Name == "DataList")
+                        {
+                            source = new ListSource(tmpStr);
+                            tmpStr = element.GetAttribute("value");
+                            if (!string.IsNullOrEmpty(tmpStr))
+                            {
+                                (source as ListSource).LoadData(tmpStr.Split(','));
+                            }
+                            tmpStr = element.GetAttribute("field");
+                            if (!string.IsNullOrEmpty(tmpStr))
+                            {
+                                (source as ListSource).Field = tmpStr;
+                            }
+                        }
+                        else
+                        {
+                            source = new Source(tmpStr);
+                        }
+                        list.Add(source);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                throw new Exception(string.Format("值{0}解析出错！", tmpStr), ex);
+            }
+            return list;
+        }
+
+        /// <summary>
+        /// 获取XML配置实例
+        /// </summary>
+        /// <param name="configFile">配置文件路径</param>
+        /// <param name="parseErrorExit">遇到解析错误退出；否则,用取默认值</param>
+        /// <returns>返回实例对象</returns>
+        public static ExportRuleConfig NewInstance(string configFile, string xsdFile = null, bool parseErrorExit = true)
+        {
+            return NewInstance(XmlReader.Create(configFile), xsdFile, parseErrorExit);
+        }
+        /// <summary>
+        /// 获取XML配置实例
+        /// </summary>
+        /// <param name="stream">XML流</param>
+        /// <param name="parseErrorExit">是否解析异常退出</param>
+        /// <returns>xml配置规则实例</returns>
+        public static ExportRuleConfig NewInstance(Stream stream, string xsdFile = null, bool parseErrorExit = true)
+        {
+            return NewInstance(XmlReader.Create(stream), xsdFile, parseErrorExit);
+        }
+        /// <summary>
+        /// 获取XML配置实例
+        /// </summary>
+        /// <param name="textReader">文本Reader</param>
+        /// <param name="parseErrorExit">是否解析异常退出</param>
+        /// <returns>xml配置规则实例</returns>
+        public static ExportRuleConfig NewInstance(TextReader textReader, string xsdFile = null, bool parseErrorExit = true)
+        {
+            return NewInstance(XmlReader.Create(textReader), xsdFile, parseErrorExit);
+        }
+        /// <summary>
+        /// 获取XML配置实例
+        /// </summary>
+        /// <param name="xmlReader">xmlReader</param>
+        /// <param name="parseErrorExit">是否解析异常退出</param>
+        /// <returns>xml配置规则实例</returns>
+        public static ExportRuleConfig NewInstance(XmlReader xmlReader, string xsdFile = null, bool parseErrorExit = true)
+        {
+            ExportRuleConfig config = new ExportRuleConfig(xmlReader, xsdFile, parseErrorExit);
+            return config;
+        }
+
+        /// <summary>
+        /// 加载数据源
+        /// </summary>
+        /// <param name="productType">产出物类型名称</param>
+        /// <param name="dataSet">数据源</param>
+        /// <returns>产出物</returns>
+        public ProductRule LoadData(string productType, DataSet dataSet)
+        {
+            ProductRule prod = GetProductRule(productType);
+            if (prod != null)
+            {
+                prod.LoadData(dataSet);
+            }
+            return prod;
+        }
+
+        /// <summary>
+        /// 加载数据源（DataSet的DataSetName作为产出物规则名称）
+        /// </summary>
+        /// <param name="prod">产出物规则</param>
+        /// <param name="dataSet">数据源</param>
+        public ProductRule LoadData(DataSet dataSet)
+        {
+            return LoadData(dataSet.DataSetName, dataSet);
+        }
+
+        /// <summary>
+        /// 根据名称获取产出物规则对象
+        /// </summary>
+        /// <param name="name"></param>
+        /// <returns></returns>
+        public ProductRule GetProductRule(string name)
+        {
+            IEnumerable<ProductRule> prods = _productTypes.Where(p => p.Name == name);
+            if (prods.Count() > 0)
+                return prods.First();
+            return null;
+        }
+
+        public override string ToString()
+        {
+            return string.Format("<ExportConfig>\n{0}\n</ExportConfig>", string.Join("\n", _productTypes));
+        }
+
+        #region 测试区域
+
+        public static void test()
+        {
+            //Location location = new Location("C23");
+            //Console.WriteLine(location);
+            //location = new Location("CAB26");
+            //Console.WriteLine(location);
+            //location = new Location("A2:C15");
+            //Console.WriteLine(location);
+            //location = new Location("H4:D15");
+            //Console.WriteLine(location);
+
+            //string file = @"H:\20150420\MyTestPlatform\Console\ExportConfig.xml";
+            //ExportConfig config = ExportConfig.NewInstance(file);
+            //Console.WriteLine(config.ToString());
+
+            //Table table = new Table();
+            //Console.Write(table.SumLocation);
+        }
+
+        public static void testXML()
+        {
+            //1、测试前，先将Export.xml的根结点添加命名空间属性：xmlns="http://tempuri.org/schema.xsd"
+            //   不默认添加此属性的话，是因为它会造成xpath查询子元素时必须使用命名空间，否则获取子元素为空
+
+            string xsdFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ExcelTemplate/ExportConfig.xsd");
+            XmlSchemaSet schemas = new XmlSchemaSet();
+            schemas.Add("http://tempuri.org/schema.xsd", XmlReader.Create(xsdFile));
+
+            string xmlFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ExcelTemplate/ExportConfig.xml");
+            XmlDocument xmlDoc = new XmlDocument();
+            xmlDoc.Load(xmlFile);
+            xmlDoc.Schemas = schemas;
+
+            StringBuilder sbStr = new StringBuilder();
+            xmlDoc.Validate(new ValidationEventHandler((obj, e) =>
+            {
+                if (e.Severity == XmlSeverityType.Error)
+                {
+                    sbStr.AppendLine(e.Message);
+                }
+                else
+                {
+                    sbStr.AppendLine(e.Message);
+                }
+            }));
+            Console.WriteLine(sbStr.ToString());
+        }
+
+        public void test2()
+        {
+            true.ToString();
+        }
+
+        #endregion 测试区域
+    }
+}

@@ -1,0 +1,666 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Data;
+using System.IO;
+using System.Linq;
+using System.Text;
+using NPOI.SS.UserModel;
+using NPOI.SS.Util;
+using NPOI.HSSF.Util;
+using ExportIO.Export.Entity;
+using ExportIO.Export.Util;
+using ExportIO.Export.Entity.Region;
+
+namespace ExportIO.Export
+{
+
+    /// <summary>
+    /// 产出物
+    /// </summary>
+    [Obsolete("由ProductWriter类取代")]
+    public class NPOIExcelProduct
+    {
+        private ProductRule _productType;
+        private DataSet _dataSet;
+        private string[] _allTempleteSheets;
+
+        /// <summary>
+        /// 批注作者
+        /// </summary>
+        public string CommentAuthor
+        {
+            get { return _productType.CommentAuthor; }
+            set { _productType.CommentAuthor = value; }
+        }
+        /// <summary>
+        /// 填充类型以数据优先还是单元格优先（在XML未配置FieldType情况下生效）
+        /// </summary>
+        public bool DataFirst
+        {
+            get { return _productType.DataFirst; }
+            set { _productType.DataFirst = value; }
+        }
+
+        /// <summary>
+        /// 构建产出物
+        /// </summary>
+        /// <param name="productType">产出物导出规则</param>
+        /// <param name="dataSet">数据集</param>
+        /// <param name="dataFirst">填充类型数据优先还是单元格优先</param>
+        public NPOIExcelProduct(ProductRule productType, DataSet dataSet = null, bool dataFirst = true)
+        {
+            this._productType = productType;
+            //this._dataSet = dataSet;
+            this.LoadData(dataSet);
+            this._productType.DataFirst = dataFirst;
+        }
+
+        /// <summary>
+        /// 加载数据源
+        /// </summary>
+        /// <param name="datas">数据集</param>
+        public void LoadData(DataSet datas)
+        {
+            this._dataSet = datas;
+            _productType.LoadData(datas);
+        }
+
+        /// <summary>
+        /// 将数据填充模板导出到文件
+        /// </summary>
+        /// <param name="exportFile">文件路径</param>
+        public void Export(string exportFile)
+        {
+            using (FileStream fs = new FileStream(exportFile, FileMode.Create))
+            {
+                Export(fs);
+            }
+        }
+
+        /// <summary>
+        /// 将数据填充模板后导出到流
+        /// </summary>
+        /// <param name="stream">流（文件流、Response流等）</param>
+        public void Export(Stream stream)
+        {
+            if (_dataSet == null) throw new Exception("DataSet is null!");
+            IWorkbook book = null;
+            using (Stream fStream = new FileStream(_productType.Template, FileMode.Open, FileAccess.Read))
+            {
+                //IWorkbook book = isOld ? (IWorkbook)new HSSFWorkbook(fStream) : new XSSFWorkbook(fStream);
+                book = WorkbookFactory.Create(fStream);
+
+                //记录模板的Sheet
+                List<string> sheetnames = new List<string>();
+                for (int i = 0; i < book.NumberOfSheets; i++)
+                {
+                    sheetnames.Add(book.GetSheetName(i));
+                }
+                _allTempleteSheets = sheetnames.ToArray();
+            }
+            foreach (var sheet in _productType.Sheets)
+            {
+                ISheet exSheet = book.GetSheet(sheet.Name);
+                if (exSheet != null)
+                {
+                    if (!sheet.IsDynamic)
+                    {
+                        WriteSheet(exSheet, sheet);
+                    }
+                    else
+                    {
+                        exSheet.IsSelected = false;
+                        foreach (var dSheet in sheet.GetDynamics())
+                        {
+                            ISheet newSheet = exSheet.CopySheet(dSheet.NameRule);
+                            WriteSheet(newSheet, dSheet);
+                        }
+                        if (!sheet.KeepTemplate)
+                        {
+                            book.RemoveSheetAt(book.GetSheetIndex(exSheet));//删除模板
+                        }
+                    }
+                }
+            }
+            ShrinkSheet(book);
+            book.Write(stream);
+        }
+
+        private void WriteSheet(ISheet exSheet, Sheet sheet)
+        {
+            foreach (var table in sheet.Tables)
+            {
+                if (table is RegionTable)
+                {
+                    WriteHeaderTable(exSheet, table as RegionTable);
+                }
+                else if (table is Table)
+                {
+                    WriteDataToTable(exSheet, table as Table);
+                }
+                else if (table is DynamicArea)
+                {
+                    WriteDynamicArea(exSheet, table as DynamicArea);
+                }
+            }
+            //在Table之后处理的目的:让依赖于填充区域的Cell(图片)能够自由填充
+            //WriteDataToCells(exSheet, sheet);
+            foreach (var cell in sheet.Cells)
+            {
+                WriteDataToCell(exSheet, cell);
+            }
+            exSheet.ForceFormulaRecalculation = true;
+        }
+
+        private void WriteDynamicArea(ISheet exSheet, DynamicArea dynamicArea)
+        {
+            int baseRow = dynamicArea.RowIndex;
+            for (int i = 1; i < dynamicArea.Count; i++)
+            {
+                for (int j = 0; j < dynamicArea.Location.RowCount; j++)
+                {
+                    NPOIExcelUtil.CopyRow(exSheet, baseRow + j, baseRow + j + dynamicArea.Location.RowCount * i);
+                }
+            }
+            foreach (var container in dynamicArea.GetAllContainers())
+            {
+                Table table = container as Table;
+                if (table != null && table.CopyFill && table.RowCount > 1)
+                {
+                    WriteDataToTable(exSheet, table);
+                }
+                else if (container is Cell)
+                {
+                    WriteDataToCell(exSheet, container as Cell);
+                }
+            }
+
+        }
+
+        private void WriteHeaderTable(ISheet exSheet, RegionTable headerTable)
+        {
+            int colHeaderLevel = headerTable.ColumnHeaderLevel;
+            int rowHeaderLevel = headerTable.RowHeaderLevel;
+            //1、Excel格式准备
+            ICell exCell = GetStandardCell(exSheet, headerTable.RowIndex, headerTable.ColIndex, true);
+            NPOIExcelUtil.CopyCell(exSheet, exCell, exCell.ColumnIndex + 1, headerTable.ColCount - 1);
+            NPOIExcelUtil.CopyRow(exSheet, exCell.RowIndex, exCell.RowIndex + 1, rowHeaderLevel - 1);
+
+            exCell = GetStandardCell(exSheet, headerTable.RowIndex + rowHeaderLevel, headerTable.ColIndex);
+            NPOIExcelUtil.CopyCell(exSheet, exCell, exCell.ColumnIndex + 1, headerTable.ColCount - 1);
+            NPOIExcelUtil.CopyRow(exSheet, exCell.RowIndex, exCell.RowIndex + 1, headerTable.RowCount - rowHeaderLevel - 1);
+
+            //2、数据填充
+            IList<OutputNode> nodes = headerTable.GetNodes();
+            foreach (var node in nodes)
+            {
+                int rowIndex = node.RowIndex;
+                IRow exRow = exSheet.GetRow(rowIndex);
+                if (exRow == null) continue;
+                exCell = exRow.GetCell(node.ColumnIndex);
+                if (exCell == null) continue;
+                if (node.ColumnSpan > 1 || node.RowSpan > 1)
+                {
+                    exSheet.AddMergedRegion(new CellRangeAddress(rowIndex, rowIndex + node.RowSpan - 1, node.ColumnIndex, node.ColumnIndex + node.ColumnSpan - 1));
+                }
+                NPOIExcelUtil.SetCellValueByDataType(exCell, node.Content);
+            }
+
+            //3、自适应宽度
+            for (int i = 0; i < headerTable.ColCount; i++)
+            {
+                int endRow = headerTable.RowIndex + (i < colHeaderLevel || rowHeaderLevel == 0 ? headerTable.RowCount : rowHeaderLevel) - 1;
+                NPOIExcelUtil.AutoFitColumnWidth(exSheet, headerTable.ColIndex + i, headerTable.RowIndex, endRow);
+            }
+
+            //4、锁定标题区域(只有列标题、只有行标题、多行多列标题三种情况锁定不一样）
+            if (headerTable.Freeze)
+            {
+                NPOIExcelUtil.Freeze(exSheet, rowHeaderLevel > 0 ? headerTable.RowIndex + rowHeaderLevel : 0, colHeaderLevel > 0 ? headerTable.ColIndex + colHeaderLevel : 0);
+            }
+
+            NPOIExcelUtil.SetAreaBorder(exSheet, headerTable.RowIndex, headerTable.ColIndex, headerTable.RowCount, headerTable.ColCount);
+        }
+
+        /// <summary>
+        /// 移除合并单元格并返回合并区域“列索引及列宽”
+        /// </summary>
+        /// <param name="row">行</param>
+        /// <returns></returns>
+        private Dictionary<int, int> ClearMergeRegion(IRow row, int fromCol, int endCol)
+        {
+            List<int> regions = new List<int>();
+            Dictionary<int, int> dict = new Dictionary<int, int>();
+            ISheet sheet = row.Sheet;
+            int colCount = 0;
+            for (int i = fromCol; i <= endCol; i++)
+            {
+                for (int j = 0; j < sheet.NumMergedRegions; j++)
+                {
+                    CellRangeAddress region = sheet.GetMergedRegion(j);
+                    if (region.IsInRange(row.RowNum, i))
+                    {
+                        colCount = region.LastColumn - region.FirstColumn + 1;
+                        regions.Add(j);
+                        dict.Add(i, colCount);
+                        i += colCount;
+                        if (i > row.LastCellNum)
+                            break;
+                    }
+                }
+            }
+            //避免删除过程中指针问题
+            regions = regions.OrderByDescending(p => p).ToList();
+            foreach (var index in regions)
+            {
+                sheet.RemoveMergedRegion(index);
+            }
+            return dict;
+        }
+
+        private void WriteDataToTable(ISheet exSheet, Table table)
+        {
+            Source source = table.GetSource();
+            if (source == null) return;
+            DataTable dt = source.Table;
+            if (dt == null) return;
+
+            ////根据XML指定区域与数据源，计算实际可填充区域(table根据字段数与字段位置或指定区域自动获得区域）
+            int rowCount = table.RowCount;//table.Location.RowCount == 0 ? dt.Rows.Count : table.Location.RowCount;
+            int colCount = table.ColCount; //列数必须由XML决定（指定区域或根据字段[位置或数量]计算）
+            int rowIndexBase = table.RowIndex;//table.Location.RowIndex + increasedRowCount;//XML是根据模板设置，要加上填充区域的基数
+            int colIndexBase = table.ColIndex;
+
+            IRow styleRow = exSheet.GetRow(rowIndexBase);
+            if (styleRow == null) return;
+
+            //1、暂时移除区域中的合并单元格
+            Dictionary<int, int> dict = ClearMergeRegion(styleRow, colIndexBase, colIndexBase + colCount - 1);
+            if (table.CopyFill && rowCount > 1)
+            {
+                NPOIExcelUtil.CopyRow(exSheet, rowIndexBase, rowIndexBase + 1, rowCount - 1);
+            }
+            IList<OutputNode> nodes = table.GetNodes();
+            //2、根据合并单元格调整结点区域
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                //在行区域范围内，有合并单元格且导出规则未指定合并时，需要以合并单元格为准
+                if (rowIndexBase <= nodes[i].RowIndex && nodes[i].RowIndex < rowIndexBase + rowCount
+                    && dict.ContainsKey(nodes[i].ColumnIndex) && nodes[i].ColumnSpan == 1)
+                {
+                    nodes[i].ColumnSpan = dict[nodes[i].ColumnIndex];
+                }
+            }
+            foreach (var node in nodes)
+            {
+                int rowIndex = node.RowIndex;
+                IRow exRow = exSheet.GetRow(rowIndex);
+                if (exRow == null) continue;
+                ICell exCell = exRow.GetCell(node.ColumnIndex);
+                if (exCell == null) continue;
+                if (node.ColumnSpan > 1 || node.RowSpan > 1)
+                {
+                    exSheet.AddMergedRegion(new CellRangeAddress(rowIndex, rowIndex + node.RowSpan - 1, node.ColumnIndex, node.ColumnIndex + node.ColumnSpan - 1));
+                }
+                if (node.Convertor != null)
+                {
+                    node.Convertor.OnSetValue(exCell, node.Content);
+                }
+                else
+                {
+                    NPOIExcelUtil.SetCellValueByDataType(exCell, node.Content);
+                }
+                node.OnRender(exCell);
+            }
+        }
+
+        private void WriteDataToCell(ISheet exSheet, Cell cell)
+        {
+            if (cell == null) return;
+            object tmpObject = cell.GetValue();
+            if (tmpObject == null) return;
+
+            IWorkbook book = exSheet.Workbook;
+            //IDrawing draw = exSheet.DrawingPatriarch ?? exSheet.CreateDrawingPatriarch();
+            IDrawing draw = exSheet.DrawingPatriarch ?? exSheet.CreateDrawingPatriarch();//只能有一个实例，否则只有最后一个对象生效
+
+            int rowIndex = cell.RowIndex;
+            int colIndex = cell.ColIndex;
+            IRow exRow = exSheet.GetRow(rowIndex);
+            if (exRow != null)
+            {
+                ICell exCell = exRow.GetCell(cell.ColIndex);
+                if (exCell != null)
+                {
+                    //object tmpObject = sheet.IsDynamic ? sheet.GetValue(cell,sheetName) : dt.Rows[cell.DataIndex][cell.Field];
+                    if (cell.ValueAppend)
+                    {
+                        tmpObject = exCell.StringCellValue + tmpObject;
+                    }
+                    if (tmpObject.GetType() == typeof(byte[]))//处理图片
+                    {
+                        CellRangeAddress region = NPOIExcelUtil.GetRange(exCell);
+
+                        IClientAnchor anchor = region != null ?
+                            draw.CreateAnchor(20, 20, 0, 0, region.FirstColumn, region.FirstRow, region.LastColumn + 1, region.LastRow + 1) :
+                            draw.CreateAnchor(20, 20, 0, 0, colIndex, rowIndex, colIndex + cell.ColCount, rowIndex + cell.RowCount);
+                        IPicture pic = draw.CreatePicture(anchor, book.AddPicture((byte[])tmpObject, PictureType.JPEG));
+                    }
+                    else
+                    {
+                        exCell.SetCellValue((tmpObject ?? "").ToString());
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 处理孤立单元格
+        /// </summary>
+        /// <param name="exSheet">Excel表单对象</param>
+        /// <param name="sheet">表单设置</param>
+        //private void WriteDataToCells(ISheet exSheet, Sheet sheet)
+        //{
+        //    IWorkbook book = exSheet.Workbook;
+        //    //IDrawing draw = exSheet.DrawingPatriarch ?? exSheet.CreateDrawingPatriarch();
+        //    IDrawing draw = exSheet.DrawingPatriarch ?? exSheet.CreateDrawingPatriarch();//只能有一个实例，否则只有最后一个对象生效
+        //    foreach (var cell in sheet.Cells)
+        //    {
+        //        //DataTable dt = cell.Source.Table;
+        //        //if ((cell.Source == null || cell.Source.Table == null) && !sheet.IsDynamic) continue; //如不存在忽略
+        //        object tmpObject = cell.GetValue();
+        //        if (tmpObject == null) continue;
+
+        //        int rowIndex = cell.RowIndex + sheet.GetIncreasedRow(cell.RowIndex);
+        //        int colIndex = cell.ColIndex;
+        //        IRow exRow = exSheet.GetRow(rowIndex);
+        //        if (exRow != null)
+        //        {
+        //            ICell exCell = exRow.GetCell(cell.ColIndex);
+        //            if (exCell != null)
+        //            {
+        //                //object tmpObject = sheet.IsDynamic ? sheet.GetValue(cell,sheetName) : dt.Rows[cell.DataIndex][cell.Field];
+        //                if (cell.ValueAppend)
+        //                {
+        //                    tmpObject = exCell.StringCellValue + tmpObject;
+        //                }
+        //                if (tmpObject.GetType() == typeof(byte[]))//处理图片
+        //                {
+        //                    CellRangeAddress region = NPOIExcelUtil.GetRange(exCell);
+
+        //                    IClientAnchor anchor = region != null ?
+        //                        draw.CreateAnchor(20, 20, 0, 0, region.FirstColumn, region.FirstRow, region.LastColumn + 1, region.LastRow + 1) :
+        //                        draw.CreateAnchor(20, 20, 0, 0, colIndex, rowIndex, colIndex + cell.ColCount, rowIndex + cell.RowCount);
+        //                    IPicture pic = draw.CreatePicture(anchor, book.AddPicture((byte[])tmpObject, PictureType.JPEG));
+        //                    //pic.Resize(); //图片恢复原有大小
+        //                    //if (pic is NPOI.HSSF.UserModel.HSSFPicture)
+        //                    //{
+        //                    //    (pic as NPOI.HSSF.UserModel.HSSFPicture).LineStyle = LineStyle.Solid;
+        //                    //    (pic as NPOI.HSSF.UserModel.HSSFPicture).LineStyleColor = IndexedColors.Black.Index;
+        //                    //}
+        //                    //else
+        //                    //{
+        //                    //    (pic as NPOI.XSSF.UserModel.XSSFPicture).LineStyle = LineStyle.Solid;
+        //                    //    (pic as NPOI.XSSF.UserModel.XSSFPicture).SetLineStyleColor(IndexedColors.Black.Index);
+        //                    //}
+        //                }
+        //                else
+        //                {
+        //                    exCell.SetCellValue((tmpObject ?? "").ToString());
+        //                }
+        //            }
+        //        }
+        //    }
+        //}
+
+        /// <summary>
+        /// 填充区域
+        /// </summary>
+        /// <param name="exSheet">Excel表单对象</param>
+        /// <param name="table">区域填充规则</param>
+        /// <param name="increasedRowCount">累计填充行数</param>
+        //private void WriteDataToTable(ISheet exSheet, Table table)
+        //{
+        //    Source source = table.GetSource();
+        //    if (source == null) return;
+        //    DataTable dt = source.Table;
+        //    if (dt == null) return;
+
+        //    //根据XML指定区域与数据源，计算实际可填充区域(table根据字段数与字段位置或指定区域自动获得区域）
+        //    int rowCount = table.RowCount;//table.Location.RowCount == 0 ? dt.Rows.Count : table.Location.RowCount;
+        //    int colCount = table.ColCount; //列数必须由XML决定（指定区域或根据字段[位置或数量]计算）
+        //    int rowIndexBase = table.RowIndex;//table.Location.RowIndex + increasedRowCount;//XML是根据模板设置，要加上填充区域的基数
+        //    int colIndexBase = table.ColIndex;
+
+        //    IRow styleRow = exSheet.GetRow(rowIndexBase);
+        //    if (styleRow == null) return;
+
+        //    #region 创建填充区域空间
+
+        //    if (table.CopyFill && rowCount > 1)
+        //    {
+        //        //批量复制单元格(复制单元格[样式]、合并区域）
+        //        NPOIExcelUtil.CopyRow(exSheet, rowIndexBase, rowIndexBase + 1, rowCount - 1);
+
+        //        //increasedRowCount += ExportUtil.CopyRowByOriginalWay(exSheet, rowIndexBase, rowIndexBase + 1, rowCount - 1);
+        //        //exSheet.RemoveRow(styleRow);//用ShiftRows时无需RemoveRow(将会被废除，除非为节省Excel空间）
+        //        //exSheet.ShiftRows(rowIndexBase + 1, exSheet.LastRowNum, -1);
+        //    }
+
+        //    #endregion 创建填充区域空间
+
+        //    IRow exRow = null;
+        //    ICell exCell = null;
+        //    int curRowIndex = -1;
+        //    object tmpObject = null;
+        //    string tmpStr = null;
+
+        //    for (int rOffset = 0; rOffset < rowCount; rOffset++)
+        //    {
+        //        curRowIndex = rowIndexBase + rOffset;
+        //        exRow = exSheet.GetRow(curRowIndex);
+
+        //        //控制有效行范围
+        //        if (rowIndexBase <= curRowIndex && curRowIndex < rowIndexBase + rowCount)
+        //        {
+        //            exRow.Height = styleRow.Height;//强制行高一致：复制过程中行高会变化
+
+        //            //设置行号
+        //            if (table.RowNumIndex >= 0)
+        //            {
+        //                exCell = exRow.GetCell(table.RowNumIndex);
+        //                exCell.SetCellValue(rOffset + 1);
+        //            }
+
+        //            foreach (var field in table.Fields)
+        //            {
+        //                exCell = exRow.GetCell(field.ColIndex);
+        //                //控制有效列范围：控制填充区域
+        //                if (colIndexBase <= field.ColIndex && field.ColIndex < colIndexBase + colCount)
+        //                {
+        //                    //（1）填充值
+        //                    tmpObject = dt.Rows[rOffset][field.Name];
+        //                    if (tmpObject != null && !(tmpObject is System.DBNull))
+        //                    {
+        //                        SetCellValue(exCell, field, tmpObject);
+        //                    }
+        //                    else if (!string.IsNullOrEmpty(field.EmptyFill))
+        //                    {
+        //                        exCell.SetCellValue(field.EmptyFill);
+        //                    }
+
+        //                    //（2）XML设置单元格的合并（列合并将删除所有原有合并区域重新建立合并区域）
+        //                    if (field.ColSpan > 1 && !field.Spannable)
+        //                    {
+        //                        exSheet.AddMergedRegion(new NPOI.SS.Util.CellRangeAddress(exCell.RowIndex, exCell.RowIndex, exCell.ColumnIndex, exCell.ColumnIndex + field.ColSpan - 1));
+        //                    }
+
+        //                    //（3）批注
+        //                    if (!string.IsNullOrEmpty(field.CommentColumn))
+        //                    {
+        //                        tmpStr = dt.Rows[rOffset][field.CommentColumn] + "";
+        //                        if (!string.IsNullOrEmpty(tmpStr))
+        //                        {
+        //                            NPOIExcelUtil.AddComment(exCell, _productType.CommentAuthor, tmpStr);
+        //                        }
+        //                    }
+
+        //                    //（4）链接
+        //                    if (!string.IsNullOrEmpty(field.LinkType) && !string.IsNullOrEmpty(field.RefColumn))
+        //                    {
+        //                        tmpStr = dt.Rows[rOffset][field.RefColumn] + "";
+        //                        if (!string.IsNullOrEmpty(tmpStr))
+        //                        {
+        //                            HyperlinkType linkType = HyperlinkType.Unknown;
+        //                            if ("auto".Equals(field.LinkType.ToLower()))
+        //                            {
+        //                                linkType = NPOIExcelUtil.GetLinkTypeByData(tmpStr);
+        //                                linkType = linkType == HyperlinkType.Unknown ? HyperlinkType.Url : linkType;
+        //                            }
+        //                            else if (!Enum.TryParse(field.LinkType, true, out linkType))
+        //                            {
+        //                                //默认URL类型（Excel2003用Unknown时会报引用为空错误；Excel2007中如Address与LinkType不匹配会报错，即使调整为Unknown导出Excel打开异常）
+        //                                linkType = HyperlinkType.Url; //: HyperlinkType.Unknown;
+        //                            }
+        //                            NPOIExcelUtil.AddHyperLink(exCell, linkType, tmpStr);
+        //                        }
+        //                    }
+        //                }
+        //            }
+        //        }
+        //    }
+
+        //    foreach (var field in table.Fields)
+        //    {
+        //        //超出范围的字段将不作处理
+        //        if (false == (colIndexBase <= field.ColIndex && field.ColIndex < colIndexBase + colCount)) continue;
+        //        //数据源中不存在指定字段将不作处理
+        //        if (dt.Columns[field.Name] == null) continue;
+
+        //        //（5）XML配置：下拉框设置
+        //        if (field.DropDownListSource != null)
+        //        {
+        //            NPOIExcelUtil.AddDropDownList(exSheet, field.DropDownListSource.GetStringValues(), field.ColIndex, rowIndexBase, field.ColSpan, rowIndexBase + rowCount - 1);
+        //        }
+
+        //        //（6）行或列合并:指定列根据数据合并单元格
+        //        if (field.Spannable)
+        //        {
+        //            NPOIExcelUtil.MergeRowsByData(dt, field, exSheet, rowIndexBase, rowCount);
+        //        }
+        //    }
+        //    //自适应行高
+        //    if (table.AutoFitHeight)
+        //    {
+        //        for (int i = rowIndexBase; i < rowIndexBase + rowCount; i++)
+        //        {
+        //            NPOIExcelUtil.AutoFitRowHeight(exSheet, i);
+        //        }
+        //    }
+        //    WriteSumRow(exSheet, table);
+        //}
+
+        //private void WriteSumRow(ISheet exSheet, Table table)
+        //{
+        //    IRow exRow = null;
+        //    ICell exCell = null;
+        //    int sumRowIndex = table.GetSumRowIndex();
+        //    if (sumRowIndex > -1)
+        //    {
+        //        int rowIndexBase = table.RowIndex, rowCount = table.RowCount;
+        //        //if (table.SumLocation == LocationPolicy.Tail)
+        //        //    sumRowIndex += increasedRowCount;
+        //        exRow = exSheet.GetRow(sumRowIndex);
+        //        if (exRow == null)
+        //        {
+        //            exSheet.CreateRow(sumRowIndex);
+        //        }
+        //        foreach (var colIndex in table.SumColumns)
+        //        {
+        //            exCell = exRow.GetCell(colIndex);
+        //            if (exCell == null)
+        //            {
+        //                exRow.CreateCell(colIndex);
+        //            }
+        //            exCell.SetCellFormula(string.Format("SUM({0}{1}:{0}{2})", NPOIExcelUtil.ToBase26(colIndex + 1), rowIndexBase + 1, rowIndexBase + rowCount));
+        //        }
+        //    }
+        //}
+
+        //private void SetCellValue(ICell exCell, Field field, object value)
+        //{
+        //    //优先级：(控制器)代码控制 -> XML控制 -> 数据源|Excel单元格格式
+        //    if (field.Convertor != null)
+        //    {
+        //        field.Convertor.OnSetValue(exCell, value);
+        //    }
+        //    else if (field.Type != FieldType.Unknown)
+        //    {
+        //        NPOIExcelUtil.SetCellValue(exCell, field, value);
+        //    }
+        //    else
+        //    {
+        //        //由DataType或CellType决定
+        //        if (DataFirst)
+        //        {
+        //            NPOIExcelUtil.SetCellValueByDataType(exCell, value);
+        //        }
+        //        else
+        //        {
+        //            //根据CellType确定
+        //            NPOIExcelUtil.SetCellValueByCellType(exCell, value);
+        //        }
+        //    }
+        //}
+
+        private ICell GetStandardCell(ISheet sheet, int rowIndex, int colIndex, bool isTitle = false)
+        {
+            //如存在直接返回
+            IRow row = sheet.GetRow(rowIndex);
+            if (row == null) row = sheet.CreateRow(rowIndex);
+            ICell cell = row.GetCell(colIndex);
+            if (cell != null) return cell;
+
+            //如不存在创建
+            cell = row.CreateCell(colIndex);
+            cell.CellStyle = NPOIExcelUtil.CreateCellStyle(sheet.Workbook, 0, isTitle ? HSSFColor.LightTurquoise.Index : HSSFColor.White.Index, isTitle ? HorizontalAlignment.Center : HorizontalAlignment.Left);
+            cell.CellStyle.SetFont(NPOIExcelUtil.CreateFont(sheet.Workbook, isTitle ? "微软雅黑" : "宋体"));
+            return cell;
+        }
+
+        /// <summary>
+        /// 获取未使用的Sheet名称
+        /// </summary>
+        /// <returns></returns>
+        protected string[] GetUnusedSheets()
+        {
+            string[] usedSheets = _productType.Sheets.Select(p => p.Name).ToArray();
+            return _allTempleteSheets != null ? _allTempleteSheets.Except(usedSheets).ToArray() : new string[0];
+        }
+
+        /// <summary>
+        /// 根据配置移除无用的Sheet
+        /// </summary>
+        /// <param name="book">WorkBook对象</param>
+        protected void ShrinkSheet(IWorkbook book)
+        {
+            if (_productType.ShrinkSheet)
+            {
+                string[] usedlessSheets = GetUnusedSheets();
+                if (_productType.ShrinkExSheets != null)
+                {
+                    usedlessSheets = usedlessSheets.Except(_productType.ShrinkExSheets).ToArray();
+                }
+                for (int i = 0; i < usedlessSheets.Length; i++)
+                {
+                    int sheetIndex = book.GetSheetIndex(usedlessSheets[i]);
+                    if (sheetIndex > -1)
+                    {
+                        book.RemoveSheetAt(sheetIndex);
+                    }
+                }
+            }
+        }
+
+    }
+}
